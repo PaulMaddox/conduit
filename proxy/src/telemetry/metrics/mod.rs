@@ -69,6 +69,7 @@ struct Metrics {
     tcp_connect_close_total: Metric<Counter, Arc<TransportLabels>>,
 
     tcp_connection_duration: Metric<Histogram, Arc<TransportLabels>>,
+    tcp_connections_open: Metric<Gauge, Arc<TransportLabels>>,
 
     sent_bytes: Metric<Counter, Arc<TransportLabels>>,
     received_bytes: Metric<Counter, Arc<TransportLabels>>,
@@ -104,6 +105,10 @@ struct Metric<M, L: Hash + Eq> {
 //       there are only 52 significant bits.
 #[derive(Copy, Debug, Default, Clone, Eq, PartialEq)]
 pub struct Counter(Wrapping<u64>);
+
+/// A Prometheus gauge
+#[derive(Copy, Debug, Default, Clone, Eq, PartialEq)]
+pub struct Gauge(u64);
 
 /// Tracks Prometheus metrics
 #[derive(Debug)]
@@ -202,6 +207,11 @@ impl Metrics {
             "A histogram of the duration of the lifetime of a connection, in milliseconds",
         );
 
+        let tcp_connections_open = Metric::<Gauge, Arc<TransportLabels>>::new(
+            "tcp_connections_open",
+            "A gauge of the number of TCP connections currently open.",
+        );
+
         let received_bytes = Metric::<Counter, Arc<TransportLabels>>::new(
             "received_bytes",
             "A counter of the total number of recieved bytes."
@@ -223,6 +233,7 @@ impl Metrics {
             tcp_connect_open_total,
             tcp_connect_close_total,
             tcp_connection_duration,
+            tcp_connections_open,
             received_bytes,
             sent_bytes,
             start_time,
@@ -309,6 +320,14 @@ impl Metrics {
             .or_insert_with(Default::default)
     }
 
+    fn tcp_connections_open(&mut self,
+                            labels: &Arc<TransportLabels>)
+                            -> &mut Gauge {
+        self.tcp_connections_open.values
+            .entry(labels.clone())
+            .or_insert_with(Default::default)
+    }
+
     fn sent_bytes(&mut self,
                   labels: &Arc<TransportLabels>)
                   -> &mut Counter {
@@ -329,7 +348,7 @@ impl Metrics {
 impl fmt::Display for Metrics {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f,
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nprocess_start_time_seconds {}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nprocess_start_time_seconds {}\n",
             self.request_total,
             self.request_duration,
             self.response_total,
@@ -340,6 +359,7 @@ impl fmt::Display for Metrics {
             self.tcp_connect_open_total,
             self.tcp_connect_close_total,
             self.tcp_connection_duration,
+            self.tcp_connections_open,
             self.sent_bytes,
             self.received_bytes,
             self.start_time,
@@ -387,6 +407,37 @@ impl Counter {
     }
 }
 
+// ===== impl Gauge =====
+
+impl fmt::Display for Gauge {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Gauge {
+    /// Increment the gauge by one.
+    pub fn incr(&mut self) -> &mut Self {
+        if let Some(new_value) = self.0.checked_add(1) {
+            (*self).0 = new_value;
+        } else {
+            warn!("Gauge::incr() would wrap!");
+        }
+        self
+    }
+
+    /// Decrement the gauge by one.
+    pub fn decr(&mut self) -> &mut Self {
+        if let Some(new_value) = self.0.checked_sub(1) {
+            (*self).0 = new_value;
+        } else {
+            warn!("Gauge::decr() called on a gauge with value 0");
+        }
+        self
+    }
+
+}
+
 // ===== impl Metric =====
 
 impl<M, L: Hash + Eq> Metric<M, L> {
@@ -409,6 +460,30 @@ where
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f,
             "# HELP {name} {help}\n# TYPE {name} counter\n",
+            name = self.name,
+            help = self.help,
+        )?;
+
+        for (labels, value) in &self.values {
+            write!(f, "{name}{{{labels}}} {value}\n",
+                name = self.name,
+                labels = labels,
+                value = value,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<L> fmt::Display for Metric<Gauge, L>
+where
+    L: fmt::Display,
+    L: Hash + Eq,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f,
+            "# HELP {name} {help}\n# TYPE {name} gauge\n",
             name = self.name,
             help = self.help,
         )?;
@@ -543,13 +618,16 @@ impl Aggregate {
 
             Event::TransportOpen(ref ctx) => {
                 let labels = Arc::new(TransportLabels::new(ctx));
-                self.update(|metrics| match ctx.as_ref() {
-                    &ctx::transport::Ctx::Server(_) => {
-                        *metrics.tcp_accept_open_total(&labels).incr();
-                    },
-                    &ctx::transport::Ctx::Client(_) => {
-                        *metrics.tcp_connect_open_total(&labels).incr();
-                    },
+                self.update(|metrics| {
+                    *metrics.tcp_connections_open(&labels).incr();
+                    match ctx.as_ref() {
+                        &ctx::transport::Ctx::Server(_) => {
+                            *metrics.tcp_accept_open_total(&labels).incr();
+                        },
+                        &ctx::transport::Ctx::Client(_) => {
+                            *metrics.tcp_connect_open_total(&labels).incr();
+                        },
+                    }
                 })
             },
 
@@ -558,6 +636,7 @@ impl Aggregate {
                 // there was an error.
                 let labels = Arc::new(TransportLabels::new(ctx));
                 self.update(|metrics| {
+                    *metrics.tcp_connections_open(&labels).decr();
                     *metrics.tcp_connection_duration(&labels) += close.duration;
                     *metrics.sent_bytes(&labels) += close.tx_bytes as u64;
                     *metrics.received_bytes(&labels) += close.tx_bytes as u64;
